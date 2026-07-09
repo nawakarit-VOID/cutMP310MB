@@ -41,7 +41,15 @@ func loadIcon(size int) fyne.Resource {
 		file = "assets/icons/icon-64.png"
 	}
 
-	data, _ := iconFS.ReadFile(file)
+	data, err := iconFS.ReadFile(file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot load icon %s: %v\n", file, err)
+		return fyne.NewStaticResource("missing-icon", nil)
+	}
+	if len(data) == 0 {
+		fmt.Fprintf(os.Stderr, "warning: icon %s is empty\n", file)
+		return fyne.NewStaticResource("empty-icon", nil)
+	}
 	return fyne.NewStaticResource(file, data)
 }
 
