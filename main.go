@@ -1,0 +1,421 @@
+// Copyright (c) 2026 Nawakarit
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License v3.0.
+
+package main
+
+import (
+	"embed"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/storage"
+	"fyne.io/fyne/v2/widget"
+)
+
+// convertBitrate คือ bitrate ที่ใช้ตอนแปลงไฟล์อื่น ๆ เป็น mp3 ก่อนตัด
+// ปรับได้ตามต้องการ (ยิ่งสูงยิ่งคุณภาพดีแต่ไฟล์ใหญ่ขึ้น)
+const convertBitrate = "192k"
+
+// โหลด icon
+func loadIcon(size int) fyne.Resource {
+	var file string
+
+	switch {
+	case size >= 512:
+		file = "assets/icons/icon-512.png" ///ที่อยู่
+	case size >= 256:
+		file = "assets/icons/icon-256.png"
+	case size >= 128:
+		file = "assets/icons/icon-128.png"
+	default:
+		file = "assets/icons/icon-64.png"
+	}
+
+	data, _ := iconFS.ReadFile(file)
+	return fyne.NewStaticResource(file, data)
+}
+
+//go:embed assets/icons/*
+var iconFS embed.FS
+
+//go:embed assets/font/Itim-Regular.ttf
+var fontItim []byte
+var myFont = fyne.NewStaticResource("Itim-Regular.ttf", fontItim)
+
+// = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+// # Main #
+// = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
+
+func main() {
+	a := app.NewWithID("com.nawakarit.mp3cut10MB")
+	a.Settings().SetTheme(&MyTheme{})
+	icon := loadIcon(64)
+	a.SetIcon(icon)
+
+	w := a.NewWindow("mp3cut10MB : โปรแกรมตัดไฟล์เพลง 10 MB")
+	w.Resize(fyne.NewSize(560, 500))
+	w.SetIcon(icon)
+
+	var selectedFile string
+	var outputDir string
+
+	filePathLabel := widget.NewLabel("ยังไม่ได้เลือกไฟล์เพลง")
+	filePathLabel.Wrapping = fyne.TextWrapBreak
+
+	outDirLabel := widget.NewLabel("ยังไม่ได้เลือกโฟลเดอร์ปลายทาง")
+	outDirLabel.Wrapping = fyne.TextWrapBreak
+
+	ffmpegStatusLabel := widget.NewLabel("")
+	ffmpegStatusLabel.Wrapping = fyne.TextWrapBreak
+	if p, err := findFFmpeg(); err != nil {
+		ffmpegStatusLabel.SetText("⚠ ไม่พบไฟล์ ffmpeg ที่ bundle มากับโปรแกรม: จะแปลงไฟล์ที่ไม่ใช่ .mp3 ไม่ได้ (ตัดไฟล์ .mp3 ได้ตามปกติ)")
+	} else {
+		ffmpegStatusLabel.SetText("✓ พบ ffmpeg (bundled) ที่: " + p)
+	}
+
+	sizeEntry := widget.NewEntry()
+	sizeEntry.SetText("10")
+
+	progress := widget.NewProgressBar()
+
+	logBox := widget.NewMultiLineEntry()
+	logBox.Disable()
+	logScroll := container.NewVScroll(logBox)
+	logScroll.SetMinSize(fyne.NewSize(520, 180))
+
+	appendLog := func(format string, args ...interface{}) {
+		fyne.Do(func() {
+			logBox.SetText(logBox.Text + fmt.Sprintf(format+"\n", args...))
+		})
+	}
+
+	chooseFileBtn := widget.NewButton("เลือกไฟล์เพลง", func() {
+		filter := storage.NewExtensionFileFilter([]string{
+			".mp3", ".MP3", ".wav", ".WAV", ".flac", ".FLAC",
+			".ogg", ".OGG", ".m4a", ".M4A", ".aac", ".AAC",
+			".wma", ".WMA", ".opus", ".OPUS",
+		})
+		fd := dialog.NewFileOpen(func(uc fyne.URIReadCloser, err error) {
+			if err != nil || uc == nil {
+				return
+			}
+			defer uc.Close()
+			selectedFile = uc.URI().Path()
+			filePathLabel.SetText("ไฟล์: " + selectedFile)
+		}, w)
+		fd.SetFilter(filter)
+		fd.Resize(fyne.NewSize(700, 500))
+		fd.Show()
+	})
+
+	chooseDirBtn := widget.NewButton("เลือกโฟลเดอร์ปลายทาง", func() {
+		fd := dialog.NewFolderOpen(func(lu fyne.ListableURI, err error) {
+			if err != nil || lu == nil {
+				return
+			}
+			outputDir = lu.Path()
+			outDirLabel.SetText("โฟลเดอร์ปลายทาง: " + outputDir)
+		}, w)
+		fd.Resize(fyne.NewSize(700, 500))
+		fd.Show()
+	})
+
+	var startBtn *widget.Button
+	startBtn = widget.NewButton("เริ่มตัดไฟล์", func() {
+		if selectedFile == "" {
+			dialog.ShowInformation("แจ้งเตือน", "กรุณาเลือกไฟล์เพลงก่อน", w)
+			return
+		}
+		if outputDir == "" {
+			dialog.ShowInformation("แจ้งเตือน", "กรุณาเลือกโฟลเดอร์ปลายทางก่อน", w)
+			return
+		}
+		mb, err := strconv.ParseFloat(strings.TrimSpace(sizeEntry.Text), 64)
+		if err != nil || mb <= 0 {
+			dialog.ShowInformation("แจ้งเตือน", "กรุณาระบุขนาด (MB) เป็นตัวเลขที่มากกว่า 0", w)
+			return
+		}
+		chunkSize := int64(mb * 1024 * 1024)
+
+		ext := strings.ToLower(filepath.Ext(selectedFile))
+		if ext != ".mp3" {
+			if _, err := findFFmpeg(); err != nil {
+				dialog.ShowError(fmt.Errorf("ไฟล์นี้เป็น %s ต้องใช้ ffmpeg แปลงเป็น mp3 ก่อนตัด แต่ไม่พบไฟล์ ffmpeg%s ที่ bundle มากับโปรแกรม\n\nกรุณาวางไฟล์ ffmpeg%s ไว้ในโฟลเดอร์เดียวกับโปรแกรม (หรือในโฟลเดอร์ bin/)", ext, exeSuffix(), exeSuffix()), w)
+				return
+			}
+		}
+
+		startBtn.Disable()
+		logBox.SetText("")
+		progress.SetValue(0)
+
+		go func() {
+			defer func() {
+				fyne.Do(func() { startBtn.Enable() })
+			}()
+
+			onProgress := func(p float64) {
+				fyne.Do(func() { progress.SetValue(p) })
+			}
+
+			base := strings.TrimSuffix(filepath.Base(selectedFile), filepath.Ext(selectedFile))
+
+			mp3Path := selectedFile
+			cleanupTemp := func() {}
+
+			if ext != ".mp3" {
+				appendLog("ตรวจพบไฟล์ %s: กำลังแปลงเป็น mp3 ชั่วคราวด้วย ffmpeg (bitrate %s)...", ext, convertBitrate)
+				tmpPath, err := convertToMp3(selectedFile, appendLog)
+				if err != nil {
+					appendLog("แปลงไฟล์ด้วย ffmpeg ไม่สำเร็จ: %v", err)
+					fyne.Do(func() { dialog.ShowError(err, w) })
+					return
+				}
+				mp3Path = tmpPath
+				cleanupTemp = func() { os.Remove(tmpPath) }
+				appendLog("แปลงเสร็จแล้ว กำลังตัดไฟล์ mp3 ที่ได้...")
+			} else {
+				appendLog("ตรวจพบไฟล์ MP3: จะตัดตรงจุด frame sync เพื่อไม่ให้เสียงแตก")
+			}
+			defer cleanupTemp()
+
+			partsCount, splitErr := splitMp3(mp3Path, outputDir, base, chunkSize, onProgress, appendLog)
+
+			if splitErr != nil {
+				appendLog("เกิดข้อผิดพลาด: %v", splitErr)
+				fyne.Do(func() {
+					dialog.ShowError(splitErr, w)
+				})
+				return
+			}
+
+			appendLog("เสร็จสิ้น! ตัดไฟล์ออกเป็น %d ไฟล์ย่อย ที่โฟลเดอร์:\n%s", partsCount, outputDir)
+			fyne.Do(func() {
+				dialog.ShowInformation("สำเร็จ", fmt.Sprintf("ตัดไฟล์เสร็จแล้ว %d ไฟล์ย่อย", partsCount), w)
+			})
+		}()
+	})
+
+	form := container.NewVBox(
+		widget.NewLabelWithStyle("โปรแกรมตัดไฟล์เพลง", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		ffmpegStatusLabel,
+		chooseFileBtn,
+		filePathLabel,
+		chooseDirBtn,
+		outDirLabel,
+		container.NewBorder(nil, nil, widget.NewLabel("ขนาดต่อไฟล์ย่อย (MB):"), nil, sizeEntry),
+		startBtn,
+		progress,
+		widget.NewLabel("บันทึกการทำงาน:"),
+		logScroll,
+	)
+
+	w.SetContent(container.NewPadded(form))
+	w.ShowAndRun()
+}
+
+// ---------------------- ffmpeg locating & conversion ----------------------
+
+func exeSuffix() string {
+	if runtime.GOOS == "windows" {
+		return ".exe"
+	}
+	return ""
+}
+
+// findFFmpeg หา ffmpeg ที่ใช้ได้ ตามลำดับความสำคัญ:
+//  1. ffmpeg ที่ embed มากับตัวโปรแกรมตอน build (ผ่าน go:embed) - ถ้ามี
+//  2. ไฟล์ ffmpeg ที่วางไว้ข้าง ๆ ตัวโปรแกรม (หรือในโฟลเดอร์ bin/) - ถ้า embed เป็น placeholder ว่างเปล่า
+//
+// ไม่ค้นหาใน system PATH โดยตั้งใจ เพื่อบังคับให้ใช้ ffmpeg ที่แจกมาด้วยกันเสมอ
+func findFFmpeg() (string, error) {
+
+	binName := "ffmpeg" + exeSuffix()
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("ไม่สามารถระบุตำแหน่งตัวโปรแกรมได้: %w", err)
+	}
+	exeDir := filepath.Dir(exePath)
+
+	candidate := filepath.Join(exeDir, binName)
+	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+		return candidate, nil
+	}
+
+	candidate = filepath.Join(exeDir, "bin", binName)
+	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+		return candidate, nil
+	}
+
+	return "", fmt.Errorf(
+		"ไม่พบ ffmpeg ที่ embed มากับโปรแกรม และไม่พบไฟล์ %s ในโฟลเดอร์โปรแกรม กรุณาวางไฟล์ ffmpeg ไว้ที่ %s หรือ %s",
+		binName,
+		filepath.Join(exeDir, binName),
+		filepath.Join(exeDir, "bin", binName),
+	)
+}
+
+// convertToMp3 เรียก ffmpeg แปลงไฟล์ต้นฉบับให้เป็นไฟล์ mp3 ชั่วคราว
+// คืนค่า path ของไฟล์ mp3 ชั่วคราวที่สร้างไว้ใน os.TempDir()
+func convertToMp3(srcPath string, logf func(string, ...interface{})) (string, error) {
+	ffmpegBin, err := findFFmpeg()
+	if err != nil {
+		return "", err
+	}
+
+	tmpFile, err := os.CreateTemp("", "audiosplitter_*.mp3")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	os.Remove(tmpPath) // ให้ ffmpeg เป็นคนสร้างไฟล์เองตอนเขียนผลลัพธ์
+
+	cmd := exec.Command(ffmpegBin,
+		"-y",
+		"-i", srcPath,
+		"-vn",
+		"-acodec", "libmp3lame",
+		"-b:a", convertBitrate,
+		tmpPath,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		os.Remove(tmpPath)
+		logf("ffmpeg output:\n%s", string(output))
+		return "", fmt.Errorf("ffmpeg แปลงไฟล์ล้มเหลว: %w", err)
+	}
+
+	if info, err := os.Stat(tmpPath); err != nil || info.Size() == 0 {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("ffmpeg แปลงไฟล์เสร็จแต่ไม่ได้ผลลัพธ์ (ไฟล์ว่างเปล่าหรือไม่มีอยู่จริง)")
+	}
+
+	return tmpPath, nil
+}
+
+// ---------------------- MP3 splitting (core เดียว) ----------------------
+
+// splitMp3 อ่านไฟล์ MP3 ทั้งหมดเข้าหน่วยความจำ แล้วหาจุดตัดที่ตรงกับ
+// จุดเริ่ม frame (frame sync) ที่ใกล้กับขนาดที่กำหนดมากที่สุด
+func splitMp3(srcPath, outDir, base string, chunkSize int64, onProgress func(float64), logf func(string, ...interface{})) (int, error) {
+	data, err := os.ReadFile(srcPath)
+	if err != nil {
+		return 0, err
+	}
+	total := int64(len(data))
+	if total == 0 {
+		return 0, fmt.Errorf("ไฟล์ว่างเปล่า")
+	}
+
+	const searchWindow = 8192 // ค้นหา frame sync ในช่วง +/- ไบต์นี้รอบจุดตัดเป้าหมาย
+
+	var offsets []int64
+	offsets = append(offsets, 0)
+
+	pos := chunkSize
+	for pos < total {
+		cut := findMp3FrameSync(data, pos, searchWindow)
+		if cut <= offsets[len(offsets)-1] {
+			// หาไม่เจอหรือได้ตำแหน่งที่ไม่ก้าวหน้า ใช้ตำแหน่งเดิมแบบ hard cut
+			cut = pos
+			logf("คำเตือน: ไม่พบจุด frame sync ที่ชัดเจนใกล้ตำแหน่ง %d ใช้การตัดแบบตรง ๆ แทน", pos)
+		}
+		offsets = append(offsets, cut)
+		pos = cut + chunkSize
+	}
+	offsets = append(offsets, total)
+
+	partNum := 0
+	for i := 0; i < len(offsets)-1; i++ {
+		start := offsets[i]
+		end := offsets[i+1]
+		if end <= start {
+			continue
+		}
+		partNum++
+		outName := fmt.Sprintf("%s_part%03d.mp3", base, partNum)
+		outPath := filepath.Join(outDir, outName)
+		if err := os.WriteFile(outPath, data[start:end], 0644); err != nil {
+			return partNum - 1, err
+		}
+		logf("สร้างไฟล์: %s (%.2f MB)", outName, float64(end-start)/1024/1024)
+		onProgress(float64(end) / float64(total))
+	}
+
+	return partNum, nil
+}
+
+// findMp3FrameSync ค้นหาตำแหน่งของ MP3 frame sync (0xFF Ex) ที่ใกล้กับ target มากที่สุด
+// โดยค้นหาทั้งไปข้างหน้าและข้างหลังในระยะ window ที่กำหนด
+func findMp3FrameSync(data []byte, target int64, window int) int64 {
+	n := int64(len(data))
+	start := target
+	end := target + int64(window)
+	if end > n-1 {
+		end = n - 1
+	}
+	// ค้นหาไปข้างหน้าก่อน (ปลอดภัยกว่าสำหรับการต่อไฟล์)
+	for i := start; i < end; i++ {
+		if isMp3FrameSync(data, i) {
+			return i
+		}
+	}
+	// ถ้าไม่เจอไปข้างหน้า ลองค้นหาถอยหลัง
+	backStart := target - int64(window)
+	if backStart < 0 {
+		backStart = 0
+	}
+	for i := target; i >= backStart; i-- {
+		if isMp3FrameSync(data, i) {
+			return i
+		}
+	}
+	return -1
+}
+
+func isMp3FrameSync(data []byte, i int64) bool {
+	if i < 0 || i+1 >= int64(len(data)) {
+		return false
+	}
+	b0 := data[i]
+	b1 := data[i+1]
+	if b0 != 0xFF {
+		return false
+	}
+	if (b1 & 0xE0) != 0xE0 {
+		return false
+	}
+	// version bits (b1 >> 3) & 0x3 ต้องไม่เท่ากับ 1 (reserved)
+	version := (b1 >> 3) & 0x3
+	if version == 1 {
+		return false
+	}
+	// layer bits (b1 >> 1) & 0x3 ต้องไม่เท่ากับ 0 (reserved)
+	layer := (b1 >> 1) & 0x3
+	if layer == 0 {
+		return false
+	}
+	if i+2 >= int64(len(data)) {
+		return false
+	}
+	b2 := data[i+2]
+	bitrateIdx := (b2 >> 4) & 0x0F
+	samplingIdx := (b2 >> 2) & 0x03
+	if bitrateIdx == 0x0F || samplingIdx == 0x03 {
+		return false
+	}
+	return true
+}
