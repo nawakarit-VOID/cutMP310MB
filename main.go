@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -86,9 +85,9 @@ func main() {
 	ffmpegStatusLabel := widget.NewLabel("")
 	ffmpegStatusLabel.Wrapping = fyne.TextWrapBreak
 	if p, err := findFFmpeg(); err != nil {
-		ffmpegStatusLabel.SetText("⚠ ไม่พบไฟล์ ffmpeg ที่ bundle มากับโปรแกรม: จะแปลงไฟล์ที่ไม่ใช่ .mp3 ไม่ได้ (ตัดไฟล์ .mp3 ได้ตามปกติ)")
+		ffmpegStatusLabel.SetText("⚠ ไม่พบ ffmpeg ในเครื่อง: จะแปลงไฟล์ที่ไม่ใช่ .mp3 ไม่ได้")
 	} else {
-		ffmpegStatusLabel.SetText("✓ พบ ffmpeg (bundled) ที่: " + p)
+		ffmpegStatusLabel.SetText("✓ พบ ffmpeg ในเครื่องที่: " + p)
 	}
 
 	sizeEntry := widget.NewEntry()
@@ -158,7 +157,7 @@ func main() {
 		ext := strings.ToLower(filepath.Ext(selectedFile))
 		if ext != ".mp3" {
 			if _, err := findFFmpeg(); err != nil {
-				dialog.ShowError(fmt.Errorf("ไฟล์นี้เป็น %s ต้องใช้ ffmpeg แปลงเป็น mp3 ก่อนตัด แต่ไม่พบไฟล์ ffmpeg%s ที่ bundle มากับโปรแกรม\n\nกรุณาวางไฟล์ ffmpeg%s ไว้ในโฟลเดอร์เดียวกับโปรแกรม (หรือในโฟลเดอร์ bin/)", ext, exeSuffix(), exeSuffix()), w)
+				dialog.ShowError(fmt.Errorf("ไฟล์นี้เป็น %s ต้องใช้ ffmpeg แปลงเป็น mp3 ก่อนตัด แต่ไม่พบ ffmpeg ในเครื่อง\n\nกรุณาติดตั้ง ffmpeg และให้เรียกใช้งานได้จาก PATH", ext), w)
 				return
 			}
 		}
@@ -234,44 +233,13 @@ func main() {
 
 // ---------------------- ffmpeg locating & conversion ----------------------
 
-func exeSuffix() string {
-	if runtime.GOOS == "windows" {
-		return ".exe"
-	}
-	return ""
-}
-
-// findFFmpeg หา ffmpeg ที่ใช้ได้ ตามลำดับความสำคัญ:
-//  1. ffmpeg ที่ embed มากับตัวโปรแกรมตอน build (ผ่าน go:embed) - ถ้ามี
-//  2. ไฟล์ ffmpeg ที่วางไว้ข้าง ๆ ตัวโปรแกรม (หรือในโฟลเดอร์ bin/) - ถ้า embed เป็น placeholder ว่างเปล่า
-//
-// ไม่ค้นหาใน system PATH โดยตั้งใจ เพื่อบังคับให้ใช้ ffmpeg ที่แจกมาด้วยกันเสมอ
+// findFFmpeg หา ffmpeg จากเครื่องผู้ใช้ผ่าน PATH เท่านั้น
 func findFFmpeg() (string, error) {
-
-	binName := "ffmpeg" + exeSuffix()
-
-	exePath, err := os.Executable()
+	ffmpegBin, err := exec.LookPath("ffmpeg")
 	if err != nil {
-		return "", fmt.Errorf("ไม่สามารถระบุตำแหน่งตัวโปรแกรมได้: %w", err)
+		return "", fmt.Errorf("ไม่พบ ffmpeg ใน PATH กรุณาติดตั้ง ffmpeg ในเครื่องผู้ใช้ก่อนใช้งาน")
 	}
-	exeDir := filepath.Dir(exePath)
-
-	candidate := filepath.Join(exeDir, binName)
-	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-		return candidate, nil
-	}
-
-	candidate = filepath.Join(exeDir, "bin", binName)
-	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-		return candidate, nil
-	}
-
-	return "", fmt.Errorf(
-		"ไม่พบ ffmpeg ที่ embed มากับโปรแกรม และไม่พบไฟล์ %s ในโฟลเดอร์โปรแกรม กรุณาวางไฟล์ ffmpeg ไว้ที่ %s หรือ %s",
-		binName,
-		filepath.Join(exeDir, binName),
-		filepath.Join(exeDir, "bin", binName),
-	)
+	return ffmpegBin, nil
 }
 
 // convertToMp3 เรียก ffmpeg แปลงไฟล์ต้นฉบับให้เป็นไฟล์ mp3 ชั่วคราว
