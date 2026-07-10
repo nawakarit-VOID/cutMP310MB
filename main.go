@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"errors"
 	"fmt"
@@ -91,12 +92,26 @@ func main() {
 	ffmpegStatusLabel := widget.NewLabel("")
 	ffmpegStatusLabel.Wrapping = fyne.TextWrapBreak
 	ffmpegHelpBtn := widget.NewButton("ดูวิธีติดตั้ง", func() {
-		dialog.ShowInformation(
-			"วิธีติดตั้ง ffmpeg",
-			"ติดตั้ง ffmpeg แล้วให้เรียกใช้งานคำสั่ง `ffmpeg` ได้จาก PATH\n\nLinux (Debian/Ubuntu):\n  sudo apt update\n  sudo apt install ffmpeg\n\nหลังติดตั้งเสร็จ ปิดแล้วเปิดโปรแกรมใหม่อีกครั้ง",
-			//\n\nWindows:\n  ติดตั้งผ่าน winget: winget install Gyan.FFmpeg\n  หรือดาวน์โหลดจาก https://ffmpeg.org/ แล้วเพิ่มโฟลเดอร์ bin ลง PATH\n\nmacOS:\n  brew install ffmpeg\n\nหลังติดตั้งเสร็จ ปิดแล้วเปิดโปรแกรมใหม่อีกครั้ง",
-			w,
+		body := widget.NewLabel(
+			"ติดตั้ง ffmpeg แล้วให้เรียกใช้งานคำสั่ง `ffmpeg` ได้จาก PATH\n\n" +
+				"Linux (Debian/Ubuntu):\n" +
+				"  sudo apt update\n" +
+				"  sudo apt install ffmpeg\n\n" +
+				"Windows:\n" +
+				"  winget install Gyan.FFmpeg\n" +
+				"  หรือดาวน์โหลดจาก https://ffmpeg.org/ แล้วเพิ่มโฟลเดอร์ bin ลง PATH\n\n" +
+				"macOS:\n" +
+				"  brew install ffmpeg\n\n" +
+				"หลังติดตั้งเสร็จ ปิดแล้วเปิดโปรแกรมใหม่อีกครั้ง",
 		)
+		body.Wrapping = fyne.TextWrapWord
+
+		content := container.NewVScroll(body)
+		content.SetMinSize(fyne.NewSize(460, 240))
+
+		d := dialog.NewCustom("วิธีติดตั้ง ffmpeg", "ปิด", content, w)
+		d.Resize(fyne.NewSize(500, 320))
+		d.Show()
 	})
 	if p, err := findFFmpeg(); err != nil {
 		ffmpegStatusLabel.SetText("⚠ ไม่พบ ffmpeg ในเครื่อง: กรุณาติดตั้ง ffmpeg ในเครื่องผู้ใช้ก่อนใช้งาน")
@@ -136,6 +151,11 @@ func main() {
 		})
 	}
 
+	var jobMu sync.Mutex
+	var currentJobCtx context.Context
+	var cancelJob context.CancelFunc
+	jobRunning := false
+
 	chooseFileBtn := widget.NewButton("เลือกไฟล์เพลง", func() {
 		filter := storage.NewExtensionFileFilter([]string{
 			".mp3", ".MP3", ".wav", ".WAV", ".flac", ".FLAC",
@@ -167,6 +187,21 @@ func main() {
 		fd.Show()
 	})
 
+	cancelBtn := widget.NewButton("ยกเลิกกลางคัน", func() {
+		jobMu.Lock()
+		cancel := cancelJob
+		running := jobRunning
+		jobMu.Unlock()
+		if !running || cancel == nil {
+			setStatus("ไม่มีงานที่กำลังทำอยู่")
+			return
+		}
+		setStatus("กำลังยกเลิก...")
+		appendLog("ผู้ใช้สั่งยกเลิกงานกลางคัน")
+		cancel()
+	})
+	cancelBtn.Disable()
+
 	var startBtn *widget.Button
 	startBtn = widget.NewButton("เริ่มตัดไฟล์", func() {
 		if selectedFile == "" {
@@ -193,14 +228,39 @@ func main() {
 			return
 		}
 
+		jobMu.Lock()
+		if jobRunning {
+			jobMu.Unlock()
+			dialog.ShowInformation("แจ้งเตือน", "กำลังมีงานทำงานอยู่ กรุณารอหรือกดยกเลิกก่อน", w)
+			return
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		currentJobCtx = ctx
+		cancelJob = cancel
+		jobRunning = true
+		jobMu.Unlock()
+
 		startBtn.Disable()
+		cancelBtn.Enable()
 		logBox.SetText("")
 		progress.SetValue(0)
 		setStatus("กำลังเริ่มทำงาน")
 
 		go func() {
 			defer func() {
+				jobMu.Lock()
+				if cancelJob != nil {
+					cancelJob = nil
+				}
+				jobCtx := currentJobCtx
+				currentJobCtx = nil
+				jobRunning = false
+				jobMu.Unlock()
+				if jobCtx != nil && errors.Is(jobCtx.Err(), context.Canceled) {
+					setStatus("ยกเลิกแล้ว")
+				}
 				fyne.Do(func() { startBtn.Enable() })
+				fyne.Do(func() { cancelBtn.Disable() })
 			}()
 
 			onProgress := func(p float64) {
@@ -209,8 +269,13 @@ func main() {
 
 			base := strings.TrimSuffix(filepath.Base(selectedFile), filepath.Ext(selectedFile))
 			setStatus("กำลังตรวจสอบฟอร์แมตเสียง")
-			audioCodec, audioErr := probeAudioCodec(selectedFile)
+			audioCodec, audioErr := probeAudioCodec(ctx, selectedFile)
 			if audioErr != nil {
+				if errors.Is(audioErr, context.Canceled) {
+					appendLog("ยกเลิกงานแล้ว")
+					setStatus("ยกเลิกแล้ว")
+					return
+				}
 				if errors.Is(audioErr, errNoAudioStream) {
 					appendLog("ไม่พบ audio stream ในไฟล์นี้")
 				} else {
@@ -227,8 +292,13 @@ func main() {
 			if audioCodec == "mp3" {
 				setStatus("กำลังดึง audio stream แบบ copy")
 				appendLog("สตรีมเสียงเป็น MP3: กำลังดึงออกมาตรง ๆ ด้วย ffmpeg (-c:a copy)...")
-				tmpPath, err := extractAudioStreamCopy(selectedFile, appendLog)
+				tmpPath, err := extractAudioStreamCopy(ctx, selectedFile, appendLog)
 				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						appendLog("ยกเลิกงานแล้ว")
+						setStatus("ยกเลิกแล้ว")
+						return
+					}
 					appendLog("ดึงสตรีมเสียงออกมาไม่สำเร็จ: %v", err)
 					fyne.Do(func() { dialog.ShowError(err, w) })
 					return
@@ -239,8 +309,13 @@ func main() {
 			} else {
 				setStatus("กำลังหั่นไฟล์เสียงและแปลงแบบขนาน")
 				appendLog("สตรีมเสียงไม่ใช่ MP3 (%s): กำลังแยกเป็นท่อนละ %d นาทีด้วย ffmpeg (-f segment)...", audioCodec, segmentDurationSeconds/60)
-				tmpPath, err := convertAudioBySegments(selectedFile, convertBitrate, appendLog)
+				tmpPath, err := convertAudioBySegments(ctx, selectedFile, convertBitrate, appendLog, setStatus)
 				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						appendLog("ยกเลิกงานแล้ว")
+						setStatus("ยกเลิกแล้ว")
+						return
+					}
 					appendLog("แปลงแบบแบ่งท่อนด้วย ffmpeg ไม่สำเร็จ: %v", err)
 					fyne.Do(func() { dialog.ShowError(err, w) })
 					return
@@ -252,9 +327,14 @@ func main() {
 			defer cleanupTemp()
 
 			setStatus("กำลังตัดไฟล์ตามขนาดที่กำหนด")
-			partsCount, splitErr := splitMp3(mp3Path, outputDir, base, chunkSize, onProgress, appendLog)
+			partsCount, splitErr := splitMp3(ctx, mp3Path, outputDir, base, chunkSize, onProgress, appendLog, setStatus)
 
 			if splitErr != nil {
+				if errors.Is(splitErr, context.Canceled) {
+					appendLog("ยกเลิกงานแล้ว")
+					setStatus("ยกเลิกแล้ว")
+					return
+				}
 				appendLog("เกิดข้อผิดพลาด: %v", splitErr)
 				fyne.Do(func() {
 					dialog.ShowError(splitErr, w)
@@ -283,6 +363,7 @@ func main() {
 		bitrateHint,
 		statusLabel,
 		startBtn,
+		cancelBtn,
 		progress,
 		widget.NewLabel("บันทึกการทำงาน:"),
 		logScroll,
@@ -294,13 +375,14 @@ func main() {
 
 // ---------------------- ffmpeg locating & conversion ----------------------
 
-func probeAudioCodec(srcPath string) (string, error) {
+func probeAudioCodec(ctx context.Context, srcPath string) (string, error) {
 	ffprobeBin, err := exec.LookPath("ffprobe")
 	if err != nil {
 		return "", fmt.Errorf("ไม่พบ ffprobe ใน PATH กรุณาติดตั้ง ffmpeg ให้ครบชุดก่อนใช้งาน")
 	}
 
-	cmd := exec.Command(
+	cmd := exec.CommandContext(
+		ctx,
 		ffprobeBin,
 		"-v", "error",
 		"-select_streams", "a:0",
@@ -320,7 +402,7 @@ func probeAudioCodec(srcPath string) (string, error) {
 	return codec, nil
 }
 
-func extractAudioStreamCopy(srcPath string, logf func(string, ...interface{})) (string, error) {
+func extractAudioStreamCopy(ctx context.Context, srcPath string, logf func(string, ...interface{})) (string, error) {
 	ffmpegBin, err := findFFmpeg()
 	if err != nil {
 		return "", err
@@ -334,7 +416,7 @@ func extractAudioStreamCopy(srcPath string, logf func(string, ...interface{})) (
 	tmpFile.Close()
 	os.Remove(tmpPath)
 
-	cmd := exec.Command(ffmpegBin,
+	cmd := exec.CommandContext(ctx, ffmpegBin,
 		"-y",
 		"-i", srcPath,
 		"-vn",
@@ -357,7 +439,7 @@ func extractAudioStreamCopy(srcPath string, logf func(string, ...interface{})) (
 	return tmpPath, nil
 }
 
-func convertAudioBySegments(srcPath, bitrate string, logf func(string, ...interface{})) (string, error) {
+func convertAudioBySegments(ctx context.Context, srcPath, bitrate string, logf func(string, ...interface{}), setStatus func(string)) (string, error) {
 	ffmpegBin, err := findFFmpeg()
 	if err != nil {
 		return "", err
@@ -369,7 +451,8 @@ func convertAudioBySegments(srcPath, bitrate string, logf func(string, ...interf
 	}
 
 	segmentPattern := filepath.Join(workDir, "segment_%03d.mka")
-	segmentCmd := exec.Command(
+	segmentCmd := exec.CommandContext(
+		ctx,
 		ffmpegBin,
 		"-y",
 		"-i", srcPath,
@@ -396,6 +479,7 @@ func convertAudioBySegments(srcPath, bitrate string, logf func(string, ...interf
 		os.RemoveAll(workDir)
 		return "", fmt.Errorf("ffmpeg หั่นไฟล์เสียงแล้วไม่พบส่วนย่อย")
 	}
+	setStatus(fmt.Sprintf("กำลังแปลงท่อนเสียง 0/%d", len(segments)))
 
 	mp3Dir, err := os.MkdirTemp("", "audiosplitter_mp3parts_*")
 	if err != nil {
@@ -422,9 +506,15 @@ func convertAudioBySegments(srcPath, bitrate string, logf func(string, ...interf
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
+				if ctx.Err() != nil {
+					results <- jobResult{index: idx, err: ctx.Err()}
+					continue
+				}
 				segPath := segments[idx]
 				outPath := filepath.Join(mp3Dir, fmt.Sprintf("part_%03d.mp3", idx))
-				cmd := exec.Command(
+				setStatus(fmt.Sprintf("กำลังแปลงท่อนที่ %d/%d", idx+1, len(segments)))
+				cmd := exec.CommandContext(
+					ctx,
 					ffmpegBin,
 					"-y",
 					"-i", segPath,
@@ -479,6 +569,7 @@ func convertAudioBySegments(srcPath, bitrate string, logf func(string, ...interf
 		}
 	}
 	concatListFile.Close()
+	setStatus("กำลังรวมไฟล์ MP3 กลับ")
 
 	finalFile, err := os.CreateTemp("", "audiosplitter_merged_*.mp3")
 	if err != nil {
@@ -491,7 +582,8 @@ func convertAudioBySegments(srcPath, bitrate string, logf func(string, ...interf
 	finalFile.Close()
 	os.Remove(finalPath)
 
-	concatCmd := exec.Command(
+	concatCmd := exec.CommandContext(
+		ctx,
 		ffmpegBin,
 		"-y",
 		"-f", "concat",
@@ -580,7 +672,10 @@ func convertToMp3(srcPath, bitrate string, logf func(string, ...interface{})) (s
 
 // splitMp3 อ่านไฟล์ MP3 ทั้งหมดเข้าหน่วยความจำ แล้วหาจุดตัดที่ตรงกับ
 // จุดเริ่ม frame (frame sync) ที่ใกล้กับขนาดที่กำหนดมากที่สุด
-func splitMp3(srcPath, outDir, base string, chunkSize int64, onProgress func(float64), logf func(string, ...interface{})) (int, error) {
+func splitMp3(ctx context.Context, srcPath, outDir, base string, chunkSize int64, onProgress func(float64), logf func(string, ...interface{}), setStatus func(string)) (int, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
 	data, err := os.ReadFile(srcPath)
 	if err != nil {
 		return 0, err
@@ -597,6 +692,9 @@ func splitMp3(srcPath, outDir, base string, chunkSize int64, onProgress func(flo
 
 	pos := chunkSize
 	for pos < total {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
 		cut := findMp3FrameSync(data, pos, searchWindow)
 		if cut <= offsets[len(offsets)-1] {
 			return 0, fmt.Errorf("%w ใกล้ตำแหน่ง %d", errNoFrameSync, pos)
@@ -608,12 +706,16 @@ func splitMp3(srcPath, outDir, base string, chunkSize int64, onProgress func(flo
 
 	partNum := 0
 	for i := 0; i < len(offsets)-1; i++ {
+		if ctx.Err() != nil {
+			return partNum, ctx.Err()
+		}
 		start := offsets[i]
 		end := offsets[i+1]
 		if end <= start {
 			continue
 		}
 		partNum++
+		setStatus(fmt.Sprintf("กำลังตัดไฟล์ย่อยที่ %d/%d", partNum, len(offsets)-1))
 		outName := fmt.Sprintf("%s_part%03d.mp3", base, partNum)
 		outPath := filepath.Join(outDir, outName)
 		if err := os.WriteFile(outPath, data[start:end], 0644); err != nil {
