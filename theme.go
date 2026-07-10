@@ -56,7 +56,7 @@ func (m MyTheme) Color(name fyne.ThemeColorName, v fyne.ThemeVariant) color.Colo
 
 		// 🪟 Layer / พื้นหลังพิเศษ
 		case theme.ColorNameMenuBackground: // → เมนู (dropdown / popup)
-			return color.NRGBA{255, 255, 255, 50}
+			return color.NRGBA{100, 100, 100, 255}
 
 		case theme.ColorNameOverlayBackground: // → dialog / overlay
 			return color.NRGBA{46, 46, 51, 255}
@@ -118,7 +118,7 @@ func (m MyTheme) Color(name fyne.ThemeColorName, v fyne.ThemeVariant) color.Colo
 
 		// 🪟 Layer / พื้นหลังพิเศษ
 		case theme.ColorNameMenuBackground: // → เมนู (dropdown / popup)
-			return color.NRGBA{255, 255, 255, 50}
+			return color.NRGBA{200, 200, 200, 255}
 
 		case theme.ColorNameOverlayBackground: // → dialog / overlay
 			return color.NRGBA{230, 230, 230, 255}

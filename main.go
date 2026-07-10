@@ -6,6 +6,7 @@ package main
 
 import (
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,9 +22,10 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// convertBitrate คือ bitrate ที่ใช้ตอนแปลงไฟล์อื่น ๆ เป็น mp3 ก่อนตัด
-// ปรับได้ตามต้องการ (ยิ่งสูงยิ่งคุณภาพดีแต่ไฟล์ใหญ่ขึ้น)
-const convertBitrate = "192k"
+// defaultConvertBitrate คือ bitrate เริ่มต้นตอนแปลงไฟล์อื่น ๆ เป็น mp3 ก่อนตัด
+const defaultConvertBitrate = "192k"
+
+var errNoFrameSync = errors.New("ไม่พบจุด frame sync ที่ชัดเจน")
 
 // โหลด icon
 func loadIcon(size int) fyne.Resource {
@@ -103,10 +105,16 @@ func main() {
 	sizeEntry := widget.NewEntry()
 	sizeEntry.SetText("10")
 
+	bitrateOptions := []string{"128k", "192k", "256k", "320k"}
+	bitrateSelect := widget.NewSelect(bitrateOptions, nil)
+	bitrateSelect.SetSelected(defaultConvertBitrate)
+	bitrateHint := widget.NewLabel("ยิ่ง bitrate สูง คุณภาพยิ่งดี แต่ไฟล์จะใหญ่ขึ้น")
+	bitrateHint.Wrapping = fyne.TextWrapBreak
+
 	progress := widget.NewProgressBar()
 
 	logBox := widget.NewMultiLineEntry()
-	logBox.Disable()
+	//logBox.Disable()
 	logScroll := container.NewVScroll(logBox)
 	logScroll.SetMinSize(fyne.NewSize(520, 180))
 
@@ -162,6 +170,10 @@ func main() {
 			dialog.ShowInformation("แจ้งเตือน", "กรุณาระบุขนาด (MB) เป็นตัวเลขที่มากกว่า 0", w)
 			return
 		}
+		convertBitrate := strings.TrimSpace(bitrateSelect.Selected)
+		if convertBitrate == "" {
+			convertBitrate = defaultConvertBitrate
+		}
 		chunkSize := int64(mb * 1024 * 1024)
 
 		ext := strings.ToLower(filepath.Ext(selectedFile))
@@ -192,7 +204,7 @@ func main() {
 
 			if ext != ".mp3" {
 				appendLog("ตรวจพบไฟล์ %s: กำลังแปลงเป็น mp3 ชั่วคราวด้วย ffmpeg (bitrate %s)...", ext, convertBitrate)
-				tmpPath, err := convertToMp3(selectedFile, appendLog)
+				tmpPath, err := convertToMp3(selectedFile, convertBitrate, appendLog)
 				if err != nil {
 					appendLog("แปลงไฟล์ด้วย ffmpeg ไม่สำเร็จ: %v", err)
 					fyne.Do(func() { dialog.ShowError(err, w) })
@@ -207,6 +219,19 @@ func main() {
 			defer cleanupTemp()
 
 			partsCount, splitErr := splitMp3(mp3Path, outputDir, base, chunkSize, onProgress, appendLog)
+			if errors.Is(splitErr, errNoFrameSync) {
+				appendLog("ไม่พบจุด frame sync ที่ชัดเจน: กำลังแปลงไฟล์เป็น mp3 ก่อนแล้วลองตัดใหม่...")
+				tmpPath, err := convertToMp3(selectedFile, convertBitrate, appendLog)
+				if err != nil {
+					appendLog("แปลงไฟล์ด้วย ffmpeg ไม่สำเร็จ: %v", err)
+					fyne.Do(func() { dialog.ShowError(err, w) })
+					return
+				}
+				defer os.Remove(tmpPath)
+				mp3Path = tmpPath
+				appendLog("แปลงเสร็จแล้ว กำลังลองตัดไฟล์ mp3 อีกครั้ง...")
+				partsCount, splitErr = splitMp3(mp3Path, outputDir, base, chunkSize, onProgress, appendLog)
+			}
 
 			if splitErr != nil {
 				appendLog("เกิดข้อผิดพลาด: %v", splitErr)
@@ -232,6 +257,8 @@ func main() {
 		chooseDirBtn,
 		outDirLabel,
 		container.NewBorder(nil, nil, widget.NewLabel("ขนาดต่อไฟล์ย่อย (MB):"), nil, sizeEntry),
+		container.NewBorder(nil, nil, widget.NewLabel("คุณภาพการแปลง MP3:"), nil, bitrateSelect),
+		bitrateHint,
 		startBtn,
 		progress,
 		widget.NewLabel("บันทึกการทำงาน:"),
@@ -255,7 +282,7 @@ func findFFmpeg() (string, error) {
 
 // convertToMp3 เรียก ffmpeg แปลงไฟล์ต้นฉบับให้เป็นไฟล์ mp3 ชั่วคราว
 // คืนค่า path ของไฟล์ mp3 ชั่วคราวที่สร้างไว้ใน os.TempDir()
-func convertToMp3(srcPath string, logf func(string, ...interface{})) (string, error) {
+func convertToMp3(srcPath, bitrate string, logf func(string, ...interface{})) (string, error) {
 	ffmpegBin, err := findFFmpeg()
 	if err != nil {
 		return "", err
@@ -274,7 +301,7 @@ func convertToMp3(srcPath string, logf func(string, ...interface{})) (string, er
 		"-i", srcPath,
 		"-vn",
 		"-acodec", "libmp3lame",
-		"-b:a", convertBitrate,
+		"-b:a", bitrate,
 		tmpPath,
 	)
 
@@ -316,9 +343,7 @@ func splitMp3(srcPath, outDir, base string, chunkSize int64, onProgress func(flo
 	for pos < total {
 		cut := findMp3FrameSync(data, pos, searchWindow)
 		if cut <= offsets[len(offsets)-1] {
-			// หาไม่เจอหรือได้ตำแหน่งที่ไม่ก้าวหน้า ใช้ตำแหน่งเดิมแบบ hard cut
-			cut = pos
-			logf("คำเตือน: ไม่พบจุด frame sync ที่ชัดเจนใกล้ตำแหน่ง %d ใช้การตัดแบบตรง ๆ แทน", pos)
+			return 0, fmt.Errorf("%w ใกล้ตำแหน่ง %d", errNoFrameSync, pos)
 		}
 		offsets = append(offsets, cut)
 		pos = cut + chunkSize
