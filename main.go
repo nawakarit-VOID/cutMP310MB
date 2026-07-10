@@ -84,10 +84,20 @@ func main() {
 
 	ffmpegStatusLabel := widget.NewLabel("")
 	ffmpegStatusLabel.Wrapping = fyne.TextWrapBreak
+	ffmpegHelpBtn := widget.NewButton("ดูวิธีติดตั้ง", func() {
+		dialog.ShowInformation(
+			"วิธีติดตั้ง ffmpeg",
+			"ติดตั้ง ffmpeg แล้วให้เรียกใช้งานคำสั่ง `ffmpeg` ได้จาก PATH\n\nLinux (Debian/Ubuntu):\n  sudo apt update\n  sudo apt install ffmpeg\n\nหลังติดตั้งเสร็จ ปิดแล้วเปิดโปรแกรมใหม่อีกครั้ง",
+			//\n\nWindows:\n  ติดตั้งผ่าน winget: winget install Gyan.FFmpeg\n  หรือดาวน์โหลดจาก https://ffmpeg.org/ แล้วเพิ่มโฟลเดอร์ bin ลง PATH\n\nmacOS:\n  brew install ffmpeg\n\nหลังติดตั้งเสร็จ ปิดแล้วเปิดโปรแกรมใหม่อีกครั้ง",
+			w,
+		)
+	})
 	if p, err := findFFmpeg(); err != nil {
-		ffmpegStatusLabel.SetText("⚠ ไม่พบ ffmpeg ในเครื่อง: จะแปลงไฟล์ที่ไม่ใช่ .mp3 ไม่ได้")
+		ffmpegStatusLabel.SetText("⚠ ไม่พบ ffmpeg ในเครื่อง: กรุณาติดตั้ง ffmpeg ในเครื่องผู้ใช้ก่อนใช้งาน")
+		ffmpegHelpBtn.Show()
 	} else {
 		ffmpegStatusLabel.SetText("✓ พบ ffmpeg ในเครื่องที่: " + p)
+		ffmpegHelpBtn.Hide()
 	}
 
 	sizeEntry := widget.NewEntry()
@@ -216,6 +226,7 @@ func main() {
 	form := container.NewVBox(
 		widget.NewLabelWithStyle("โปรแกรมตัดไฟล์เพลง", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		ffmpegStatusLabel,
+		ffmpegHelpBtn,
 		chooseFileBtn,
 		filePathLabel,
 		chooseDirBtn,
