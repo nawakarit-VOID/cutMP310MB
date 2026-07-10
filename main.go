@@ -26,6 +26,7 @@ import (
 const defaultConvertBitrate = "192k"
 
 var errNoFrameSync = errors.New("ไม่พบจุด frame sync ที่ชัดเจน")
+var errNoAudioStream = errors.New("ไม่พบ audio stream ในไฟล์")
 
 // โหลด icon
 func loadIcon(size int) fyne.Resource {
@@ -176,12 +177,9 @@ func main() {
 		}
 		chunkSize := int64(mb * 1024 * 1024)
 
-		ext := strings.ToLower(filepath.Ext(selectedFile))
-		if ext != ".mp3" {
-			if _, err := findFFmpeg(); err != nil {
-				dialog.ShowError(fmt.Errorf("ไฟล์นี้เป็น %s ต้องใช้ ffmpeg แปลงเป็น mp3 ก่อนตัด แต่ไม่พบ ffmpeg ในเครื่อง\n\nกรุณาติดตั้ง ffmpeg และให้เรียกใช้งานได้จาก PATH", ext), w)
-				return
-			}
+		if _, err := findFFmpeg(); err != nil {
+			dialog.ShowError(fmt.Errorf("ไม่พบ ffmpeg ในเครื่อง\n\nกรุณาติดตั้ง ffmpeg และให้เรียกใช้งานได้จาก PATH"), w)
+			return
 		}
 
 		startBtn.Disable()
@@ -198,12 +196,34 @@ func main() {
 			}
 
 			base := strings.TrimSuffix(filepath.Base(selectedFile), filepath.Ext(selectedFile))
+			audioCodec, audioErr := probeAudioCodec(selectedFile)
+			if audioErr != nil {
+				if errors.Is(audioErr, errNoAudioStream) {
+					appendLog("ไม่พบ audio stream ในไฟล์นี้")
+				} else {
+					appendLog("ตรวจสอบไฟล์เสียงไม่สำเร็จ: %v", audioErr)
+				}
+				fyne.Do(func() { dialog.ShowError(audioErr, w) })
+				return
+			}
+			appendLog("ตรวจพบ audio codec ภายในไฟล์: %s", audioCodec)
 
 			mp3Path := selectedFile
 			cleanupTemp := func() {}
 
-			if ext != ".mp3" {
-				appendLog("ตรวจพบไฟล์ %s: กำลังแปลงเป็น mp3 ชั่วคราวด้วย ffmpeg (bitrate %s)...", ext, convertBitrate)
+			if audioCodec == "mp3" {
+				appendLog("สตรีมเสียงเป็น MP3: กำลังดึงออกมาตรง ๆ ด้วย ffmpeg (-c:a copy)...")
+				tmpPath, err := extractAudioStreamCopy(selectedFile, appendLog)
+				if err != nil {
+					appendLog("ดึงสตรีมเสียงออกมาไม่สำเร็จ: %v", err)
+					fyne.Do(func() { dialog.ShowError(err, w) })
+					return
+				}
+				mp3Path = tmpPath
+				cleanupTemp = func() { os.Remove(tmpPath) }
+				appendLog("ดึงเสียงสำเร็จแล้ว กำลังตัดไฟล์ mp3 ที่ได้...")
+			} else {
+				appendLog("สตรีมเสียงไม่ใช่ MP3 (%s): กำลังแปลงเป็น mp3 ชั่วคราวด้วย ffmpeg (bitrate %s)...", audioCodec, convertBitrate)
 				tmpPath, err := convertToMp3(selectedFile, convertBitrate, appendLog)
 				if err != nil {
 					appendLog("แปลงไฟล์ด้วย ffmpeg ไม่สำเร็จ: %v", err)
@@ -213,8 +233,6 @@ func main() {
 				mp3Path = tmpPath
 				cleanupTemp = func() { os.Remove(tmpPath) }
 				appendLog("แปลงเสร็จแล้ว กำลังตัดไฟล์ mp3 ที่ได้...")
-			} else {
-				appendLog("ตรวจพบไฟล์ MP3: จะตัดตรงจุด frame sync เพื่อไม่ให้เสียงแตก")
 			}
 			defer cleanupTemp()
 
@@ -270,6 +288,69 @@ func main() {
 }
 
 // ---------------------- ffmpeg locating & conversion ----------------------
+
+func probeAudioCodec(srcPath string) (string, error) {
+	ffprobeBin, err := exec.LookPath("ffprobe")
+	if err != nil {
+		return "", fmt.Errorf("ไม่พบ ffprobe ใน PATH กรุณาติดตั้ง ffmpeg ให้ครบชุดก่อนใช้งาน")
+	}
+
+	cmd := exec.Command(
+		ffprobeBin,
+		"-v", "error",
+		"-select_streams", "a:0",
+		"-show_entries", "stream=codec_name",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		srcPath,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ตรวจสอบ audio stream ไม่สำเร็จ: %w", err)
+	}
+
+	codec := strings.TrimSpace(string(output))
+	if codec == "" {
+		return "", errNoAudioStream
+	}
+	return codec, nil
+}
+
+func extractAudioStreamCopy(srcPath string, logf func(string, ...interface{})) (string, error) {
+	ffmpegBin, err := findFFmpeg()
+	if err != nil {
+		return "", err
+	}
+
+	tmpFile, err := os.CreateTemp("", "audiosplitter_*.mp3")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	os.Remove(tmpPath)
+
+	cmd := exec.Command(ffmpegBin,
+		"-y",
+		"-i", srcPath,
+		"-vn",
+		"-c:a", "copy",
+		tmpPath,
+	)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		os.Remove(tmpPath)
+		logf("ffmpeg output:\n%s", string(output))
+		return "", fmt.Errorf("ffmpeg ดึงสตรีมเสียงออกมาล้มเหลว: %w", err)
+	}
+
+	if info, err := os.Stat(tmpPath); err != nil || info.Size() == 0 {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("ffmpeg ดึงสตรีมเสียงออกมาเสร็จแต่ไม่ได้ผลลัพธ์ (ไฟล์ว่างเปล่าหรือไม่มีอยู่จริง)")
+	}
+
+	return tmpPath, nil
+}
 
 // findFFmpeg หา ffmpeg จากเครื่องผู้ใช้ผ่าน PATH เท่านั้น
 func findFFmpeg() (string, error) {
